@@ -2,12 +2,21 @@
 
 import asyncio
 import ssl
+import random
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple, TypeVar, Any
 from dataclasses import dataclass
+from functools import wraps
 
 from .config import ConfigManager, Device, CERTS_DIR, DEFAULT_PORT
+
+# Connection retry configuration
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 0.5  # seconds
+RETRY_MAX_DELAY = 5.0  # seconds
+CONNECTION_TIMEOUT = 10  # seconds
+HANDSHAKE_TIMEOUT = 10  # seconds
 from .protocol import (
     Message, MessageType, FileInfo,
     read_message, write_message, send_file, receive_file, calculate_checksum
@@ -43,6 +52,62 @@ class TransferService:
         self.on_transfer_progress: Optional[Callable[[TransferProgress], None]] = None
         self.on_transfer_complete: Optional[Callable[[str, bool], None]] = None
         self.on_device_status_change: Optional[Callable[[str, bool], None]] = None
+        self.on_connection_retry: Optional[Callable[[str, int, int], None]] = None  # device_name, attempt, max
+    
+    async def _connect_with_retry(
+        self,
+        device: Device,
+        max_retries: int = MAX_RETRIES
+    ) -> Optional[Tuple[asyncio.StreamReader, asyncio.StreamWriter]]:
+        """Connect to a device with automatic retry and exponential backoff."""
+        last_error = None
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(device.host, device.port),
+                    timeout=CONNECTION_TIMEOUT
+                )
+                
+                # Perform handshake
+                await write_message(writer, Message(MessageType.HELLO, {
+                    "device_id": self.config.config.device_id,
+                    "device_name": self.config.config.device_name
+                }))
+                
+                msg = await asyncio.wait_for(read_message(reader), timeout=HANDSHAKE_TIMEOUT)
+                if msg and msg.type == MessageType.HELLO_ACK:
+                    return reader, writer
+                
+                # Handshake failed - close and retry
+                writer.close()
+                await writer.wait_closed()
+                last_error = Exception("Handshake failed")
+                
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    # Calculate delay with exponential backoff + jitter
+                    delay = min(
+                        RETRY_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 0.5),
+                        RETRY_MAX_DELAY
+                    )
+                    print(f"Connection to {device.name} failed (attempt {attempt}/{max_retries}), retrying in {delay:.1f}s...")
+                    if self.on_connection_retry:
+                        self.on_connection_retry(device.name, attempt, max_retries)
+                    await asyncio.sleep(delay)
+        
+        print(f"Failed to connect to {device.name} after {max_retries} attempts: {last_error}")
+        return None
+    
+    async def _safe_close(self, writer: Optional[asyncio.StreamWriter]):
+        """Safely close a writer connection."""
+        if writer:
+            try:
+                writer.close()
+                await asyncio.wait_for(writer.wait_closed(), timeout=2.0)
+            except Exception:
+                pass
     
     async def start_server(self):
         """Start the transfer server."""
@@ -267,23 +332,14 @@ class TransferService:
         file_path: Path,
         progress_callback: Optional[Callable[[TransferProgress], None]] = None
     ) -> bool:
-        """Send a file to a device."""
+        """Send a file to a device with automatic retry."""
+        conn = await self._connect_with_retry(device)
+        if not conn:
+            return False
+        
+        reader, writer = conn
+        
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(device.host, device.port),
-                timeout=10
-            )
-            
-            # Handshake
-            await write_message(writer, Message(MessageType.HELLO, {
-                "device_id": self.config.config.device_id,
-                "device_name": self.config.config.device_name
-            }))
-            
-            msg = await asyncio.wait_for(read_message(reader), timeout=10)
-            if not msg or msg.type != MessageType.HELLO_ACK:
-                return False
-            
             # Calculate checksum
             checksum = calculate_checksum(file_path)
             
@@ -323,44 +379,29 @@ class TransferService:
             
             # Wait for completion
             msg = await asyncio.wait_for(read_message(reader), timeout=30)
-            success = msg and msg.type == MessageType.FILE_COMPLETE
-            
-            writer.close()
-            await writer.wait_closed()
-            
-            return success
+            return msg is not None and msg.type == MessageType.FILE_COMPLETE
             
         except Exception as e:
             print(f"Error sending file to {device.name}: {e}")
             return False
+        finally:
+            await self._safe_close(writer)
     
     async def list_remote_dir(self, device: Device, path: str = "") -> Optional[dict]:
-        """List directory on remote device."""
+        """List directory on remote device with automatic retry."""
+        conn = await self._connect_with_retry(device)
+        if not conn:
+            return None
+        
+        reader, writer = conn
+        
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(device.host, device.port),
-                timeout=10
-            )
-            
-            # Handshake
-            await write_message(writer, Message(MessageType.HELLO, {
-                "device_id": self.config.config.device_id,
-                "device_name": self.config.config.device_name
-            }))
-            
-            msg = await asyncio.wait_for(read_message(reader), timeout=10)
-            if not msg or msg.type != MessageType.HELLO_ACK:
-                return None
-            
             # Request directory listing
             await write_message(writer, Message(MessageType.LIST_DIR_REQUEST, {
                 "path": path
             }))
             
             msg = await asyncio.wait_for(read_message(reader), timeout=30)
-            
-            writer.close()
-            await writer.wait_closed()
             
             if msg and msg.type == MessageType.LIST_DIR_RESPONSE:
                 return msg.payload
@@ -370,6 +411,8 @@ class TransferService:
         except Exception as e:
             print(f"Error listing remote dir: {e}")
             return None
+        finally:
+            await self._safe_close(writer)
     
     async def download_from_device(
         self,
@@ -377,23 +420,15 @@ class TransferService:
         remote_path: str,
         progress_callback: Optional[Callable[[TransferProgress], None]] = None
     ) -> Optional[Path]:
-        """Download a file from remote device."""
+        """Download a file from remote device with automatic retry."""
+        conn = await self._connect_with_retry(device)
+        if not conn:
+            return None
+        
+        reader, writer = conn
+        dest_path = None
+        
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(device.host, device.port),
-                timeout=10
-            )
-            
-            # Handshake
-            await write_message(writer, Message(MessageType.HELLO, {
-                "device_id": self.config.config.device_id,
-                "device_name": self.config.config.device_name
-            }))
-            
-            msg = await asyncio.wait_for(read_message(reader), timeout=10)
-            if not msg or msg.type != MessageType.HELLO_ACK:
-                return None
-            
             # Request file
             await write_message(writer, Message(MessageType.FILE_DOWNLOAD_REQUEST, {
                 "path": remote_path
@@ -421,9 +456,6 @@ class TransferService:
             
             checksum = await receive_file(reader, dest_path, file_info.size, progress_cb)
             
-            writer.close()
-            await writer.wait_closed()
-            
             # Verify checksum
             if file_info.checksum and checksum != file_info.checksum:
                 dest_path.unlink()
@@ -433,14 +465,23 @@ class TransferService:
             
         except Exception as e:
             print(f"Error downloading from {device.name}: {e}")
+            # Clean up partial download
+            if dest_path and dest_path.exists():
+                try:
+                    dest_path.unlink()
+                except Exception:
+                    pass
             return None
+        finally:
+            await self._safe_close(writer)
     
-    async def ping_device(self, device: Device) -> bool:
-        """Check if a device is online."""
+    async def ping_device(self, device: Device, timeout: float = 5.0) -> bool:
+        """Check if a device is online (single attempt, no retry)."""
+        writer = None
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(device.host, device.port),
-                timeout=5
+                timeout=timeout
             )
             
             await write_message(writer, Message(MessageType.HELLO, {
@@ -448,12 +489,20 @@ class TransferService:
                 "device_name": self.config.config.device_name
             }))
             
-            msg = await asyncio.wait_for(read_message(reader), timeout=5)
-            
-            writer.close()
-            await writer.wait_closed()
+            msg = await asyncio.wait_for(read_message(reader), timeout=timeout)
             
             return msg is not None and msg.type == MessageType.HELLO_ACK
             
         except Exception:
             return False
+        finally:
+            await self._safe_close(writer)
+    
+    async def ping_device_with_retry(self, device: Device, max_retries: int = 2) -> bool:
+        """Check if a device is online with retry."""
+        for attempt in range(max_retries):
+            if await self.ping_device(device):
+                return True
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.5)
+        return False
